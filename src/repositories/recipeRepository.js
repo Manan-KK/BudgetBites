@@ -46,7 +46,7 @@ const findRawRecipesBySpoonacularIds = (ids = []) => {
     return Promise.resolve([]);
   }
   return db.any(
-    'SELECT spoonacular_id, raw_data FROM recipes WHERE spoonacular_id IN ($1:csv)',
+    'SELECT spoonacular_id, raw_data, price_per_serving FROM recipes WHERE spoonacular_id IN ($1:csv)',
     [ids],
   );
 };

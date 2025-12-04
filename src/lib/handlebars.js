@@ -35,6 +35,14 @@ const registerHelpers = () => {
     return `$${(numericValue / 100).toFixed(2)}`;
   });
 
+  Handlebars.registerHelper('formatPrice', (value) => {
+    const numericValue = Number(value);
+    if (Number.isNaN(numericValue)) {
+      return '';
+    }
+    return numericValue.toFixed(2);
+  });
+
   Handlebars.registerHelper('formatDate', (dateValue) => {
     if (!dateValue) {
       return '';

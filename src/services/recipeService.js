@@ -144,6 +144,15 @@ const parseStoredRecipeRow = (row = {}) => {
     }
   }
 
+  // Check if price needs normalization (if > 100, it's likely in cents)
+  let needsPriceNormalization = false;
+  if (rawData.pricePerServing !== undefined && rawData.pricePerServing !== null) {
+    const price = Number(rawData.pricePerServing);
+    if (!Number.isNaN(price) && price > 100) {
+      needsPriceNormalization = true;
+    }
+  }
+
   const normalized = normalizeApiRecipe(rawData);
   if (!normalized) {
     return null;
@@ -152,9 +161,16 @@ const parseStoredRecipeRow = (row = {}) => {
   if (!normalized.id) {
     normalized.id = row.spoonacular_id || row.recipe_id;
   }
-  if ((normalized.pricePerServing === undefined || normalized.pricePerServing === null) && row.price_per_serving !== undefined) {
-    normalized.pricePerServing = row.price_per_serving !== null ? Number(row.price_per_serving) : null;
+  
+  // Always prefer price_per_serving from database (source of truth)
+  // Only use normalized price if database column is not available
+  if (row.price_per_serving !== undefined && row.price_per_serving !== null) {
+    normalized.pricePerServing = Number(row.price_per_serving);
+  } else if (needsPriceNormalization && normalized.pricePerServing !== undefined && normalized.pricePerServing !== null) {
+    // Price was normalized, keep it
+    // (already normalized by normalizeApiRecipe)
   }
+  
   if (!normalized.readyInMinutes && row.ready_in_minutes) {
     normalized.readyInMinutes = row.ready_in_minutes;
   }
@@ -302,6 +318,46 @@ const recipeHasIngredientCost = (recipe) => {
   });
 };
 
+// Helper function to normalize ingredient names for better matching
+const normalizeIngredientName = (name) => {
+  if (!name) return '';
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' '); // Normalize whitespace
+};
+
+// Helper function to find best matching price for an ingredient
+const findMatchingPrice = (ingredient, priceMap) => {
+  if (!ingredient) return null;
+
+  // Try exact match first
+  const nameKey = normalizeIngredientName(ingredient.name);
+  const originalKey = normalizeIngredientName(ingredient.original);
+  
+  // Try exact match with ingredient name
+  if (nameKey && priceMap.has(nameKey)) {
+    return priceMap.get(nameKey);
+  }
+  
+  // Try exact match with original text
+  if (originalKey && priceMap.has(originalKey)) {
+    return priceMap.get(originalKey);
+  }
+  
+  // Try partial matching - check if any price key contains the ingredient name or vice versa
+  for (const [priceKey, priceData] of priceMap.entries()) {
+    if (nameKey && (priceKey.includes(nameKey) || nameKey.includes(priceKey))) {
+      return priceData;
+    }
+    if (originalKey && (priceKey.includes(originalKey) || originalKey.includes(priceKey))) {
+      return priceData;
+    }
+  }
+  
+  return null;
+};
+
 const applyPriceBreakdownToRecipe = (recipe, priceData) => {
   if (!recipe || !priceData) {
     return recipe;
@@ -310,29 +366,42 @@ const applyPriceBreakdownToRecipe = (recipe, priceData) => {
   if (Array.isArray(recipe.extendedIngredients) && Array.isArray(priceData.ingredients)) {
     const priceMap = new Map();
     priceData.ingredients.forEach((item) => {
-      const key = (item.name || '').trim().toLowerCase();
+      const key = normalizeIngredientName(item.name);
       if (!key) {
         return;
       }
       const numericPrice = Number(item.price);
-      if (Number.isNaN(numericPrice)) {
+      if (Number.isNaN(numericPrice) || numericPrice <= 0) {
         return;
       }
 
+      // Store multiple variations of the key for better matching
       priceMap.set(key, {
         price: numericPrice,
         amount: item.amount,
         image: item.image,
       });
+      
+      // Also store the original name for exact matching
+      const originalKey = (item.name || '').trim().toLowerCase();
+      if (originalKey && originalKey !== key) {
+        priceMap.set(originalKey, {
+          price: numericPrice,
+          amount: item.amount,
+          image: item.image,
+        });
+      }
     });
 
+    let totalMatchedCost = 0;
+    let matchedCount = 0;
+    
     recipe.extendedIngredients = recipe.extendedIngredients.map((ingredient) => {
       if (!ingredient) {
         return ingredient;
       }
 
-      const key = (ingredient.name || ingredient.original || '').trim().toLowerCase();
-      const breakdown = priceMap.get(key);
+      const breakdown = findMatchingPrice(ingredient, priceMap);
 
       if (breakdown) {
         ingredient.estimatedCost = {
@@ -341,10 +410,123 @@ const applyPriceBreakdownToRecipe = (recipe, priceData) => {
           amount: breakdown.amount,
           image: breakdown.image,
         };
+        totalMatchedCost += breakdown.price;
+        matchedCount++;
       }
 
       return ingredient;
     });
+
+    // Default prices for common ingredients (in cents per typical amount)
+    const defaultPrices = {
+      'pasta': 50, 'spaghetti': 50, 'linguine': 50, 'penne': 50, 'fettuccine': 50,
+      'parmesan cheese': 100, 'parmesan': 100, 'cheese': 80,
+      'salt': 1, 'pepper': 2, 'kosher salt': 1, 'black pepper': 2, 'freshly cracked pepper': 2,
+      'oregano': 5, 'thyme': 5, 'basil': 8, 'parsley': 5, 'cilantro': 5,
+      'red pepper flakes': 3, 'pepper flakes': 3,
+      'asparagus': 150, 'onions': 30, 'onion': 30, 'peppers': 40, 'pepper': 40,
+      'flour': 10, 'olive oil': 50,
+    };
+
+    // Ingredients that should remain free (water, reserved water, etc.)
+    const freeIngredients = ['water', 'reserved', 'pasta water', 'reserved pasta water', 'reserved water'];
+    
+    // Helper to check if ingredient should be free
+    const isFreeIngredient = (ingredient) => {
+      if (!ingredient) return false;
+      const name = normalizeIngredientName(ingredient.name || ingredient.original || '');
+      if (!name) return false;
+      return freeIngredients.some(free => name.includes(free));
+    };
+
+    // Helper to get default price for an ingredient
+    const getDefaultPrice = (ingredient) => {
+      if (!ingredient || isFreeIngredient(ingredient)) return null;
+      const name = normalizeIngredientName(ingredient.name || ingredient.original || '');
+      if (!name) return null;
+      
+      // Check exact match
+      if (defaultPrices[name]) {
+        return defaultPrices[name];
+      }
+      
+      // Check if name contains any default price key (but avoid false matches)
+      for (const [key, price] of Object.entries(defaultPrices)) {
+        // Only match if the key is a significant part of the name (at least 3 chars)
+        if (key.length >= 3 && (name.includes(key) || key.includes(name))) {
+          return price;
+        }
+      }
+      
+      return null;
+    };
+
+    // If we have totalCost and some ingredients don't have prices, distribute the remainder
+    const unmatchedIngredients = recipe.extendedIngredients.filter(
+      (ing) => ing && !ing.estimatedCost
+    );
+    
+    if (unmatchedIngredients.length > 0) {
+      // First, try to use default prices for common ingredients
+      unmatchedIngredients.forEach((ingredient) => {
+        if (ingredient && !ingredient.estimatedCost) {
+          const defaultPrice = getDefaultPrice(ingredient);
+          if (defaultPrice) {
+            ingredient.estimatedCost = {
+              value: defaultPrice,
+              unit: 'US Cents',
+              amount: ingredient.amount || 0,
+            };
+            totalMatchedCost += defaultPrice;
+          }
+        }
+      });
+
+      // Then, if we have totalCost from API, distribute remaining cost
+      if (typeof priceData.totalCost === 'number' && priceData.totalCost > 0) {
+        const totalCostCents = priceData.totalCost;
+        const stillUnmatched = recipe.extendedIngredients.filter(
+          (ing) => ing && !ing.estimatedCost
+        );
+        
+        if (stillUnmatched.length > 0 && totalCostCents > totalMatchedCost) {
+          const remainingCost = totalCostCents - totalMatchedCost;
+          const costPerUnmatched = Math.max(1, Math.floor(remainingCost / stillUnmatched.length));
+          
+          stillUnmatched.forEach((ingredient) => {
+            if (ingredient && !ingredient.estimatedCost) {
+              ingredient.estimatedCost = {
+                value: costPerUnmatched,
+                unit: 'US Cents',
+                amount: ingredient.amount || 0,
+              };
+            }
+          });
+        }
+      } else if (typeof recipe.pricePerServing === 'number' && recipe.pricePerServing > 0 && recipe.servings) {
+        // Fallback: use pricePerServing to estimate costs for unmatched ingredients
+        // Distribute proportionally based on recipe cost
+        const stillUnmatched = recipe.extendedIngredients.filter(
+          (ing) => ing && !ing.estimatedCost
+        );
+        
+        if (stillUnmatched.length > 0) {
+          // Estimate total recipe cost from pricePerServing
+          const totalRecipeCostCents = Math.round(recipe.pricePerServing * recipe.servings * 100);
+          const estimatedCostPerIngredient = Math.max(10, Math.floor(totalRecipeCostCents / recipe.extendedIngredients.length));
+          
+          stillUnmatched.forEach((ingredient) => {
+            if (ingredient && !ingredient.estimatedCost) {
+              ingredient.estimatedCost = {
+                value: estimatedCostPerIngredient,
+                unit: 'US Cents',
+                amount: ingredient.amount || 0,
+              };
+            }
+          });
+        }
+      }
+    }
   }
 
   if (typeof priceData.totalCost === 'number') {
@@ -405,10 +587,29 @@ const getCachedRecipesMap = async (ids = []) => {
     const rows = await recipeRepository.findRawRecipesBySpoonacularIds(ids);
     return rows.reduce((acc, row) => {
       if (row.raw_data) {
-        const recipe = {
-          ...row.raw_data,
-          id: row.raw_data.id || row.spoonacular_id,
-        };
+        let recipe = { ...row.raw_data };
+        recipe.id = recipe.id || row.spoonacular_id;
+        
+        // Always use price_per_serving from database column as source of truth
+        if (row.price_per_serving !== undefined && row.price_per_serving !== null) {
+          let dbPrice = Number(row.price_per_serving);
+          // If price is > 100, it's likely stored in cents (old data), normalize to dollars
+          if (!Number.isNaN(dbPrice) && dbPrice > 100) {
+            recipe.pricePerServing = Number((dbPrice / 100).toFixed(2));
+          } else {
+            recipe.pricePerServing = dbPrice;
+          }
+        } else if (recipe.pricePerServing !== undefined && recipe.pricePerServing !== null) {
+          // If no database column, check if raw_data price needs normalization
+          // (if > 100, it's likely in cents and needs conversion)
+          const price = Number(recipe.pricePerServing);
+          if (!Number.isNaN(price) && price > 100) {
+            // Price is in cents, normalize to dollars
+            recipe.pricePerServing = Number((price / 100).toFixed(2));
+          }
+          // Otherwise, price is already in dollars, use as-is
+        }
+        
         acc.set(row.spoonacular_id, recipe);
       }
       return acc;
@@ -609,6 +810,45 @@ const buildGroceryList = (recipes = []) => {
   const ingredientMap = new Map();
   let totalEstimatedCost = 0;
 
+  // Default prices for common ingredients (in cents per typical amount)
+  const defaultPrices = {
+    'pasta': 50, 'spaghetti': 50, 'linguine': 50, 'penne': 50, 'fettuccine': 50,
+    'parmesan cheese': 100, 'parmesan': 100, 'cheese': 80,
+    'salt': 1, 'pepper': 2, 'kosher salt': 1, 'black pepper': 2, 'freshly cracked pepper': 2,
+    'oregano': 5, 'thyme': 5, 'basil': 8, 'parsley': 5, 'cilantro': 5, 'flat-leaf parsley': 5,
+    'red pepper flakes': 3, 'pepper flakes': 3,
+    'asparagus': 150, 'onions': 30, 'onion': 30, 'peppers': 40, 'pepper': 40,
+    'flour': 10, 'olive oil': 50,
+  };
+
+  // Ingredients that should remain free
+  const freeIngredients = ['water', 'reserved', 'pasta water', 'reserved pasta water', 'reserved water'];
+
+  // Helper to get default price for an ingredient name
+  const getDefaultPrice = (name) => {
+    if (!name) return null;
+    const normalized = name.toLowerCase().trim().replace(/\s+/g, ' ');
+    
+    // Check if it's a free ingredient
+    if (freeIngredients.some(free => normalized.includes(free))) {
+      return 0;
+    }
+    
+    // Check exact match
+    if (defaultPrices[normalized]) {
+      return defaultPrices[normalized];
+    }
+    
+    // Check if name contains any default price key (at least 3 chars)
+    for (const [key, price] of Object.entries(defaultPrices)) {
+      if (key.length >= 3 && (normalized.includes(key) || key.includes(normalized))) {
+        return price;
+      }
+    }
+    
+    return null;
+  };
+
   recipes.forEach((recipe) => {
     if (!recipe || !recipe.extendedIngredients) return;
 
@@ -619,7 +859,19 @@ const buildGroceryList = (recipes = []) => {
       }
 
       const key = resolvedName.toLowerCase();
-      const cost = ((ingredient.estimatedCost?.value) || 0) / 100;
+      
+      // Get cost from ingredient, or apply default price if missing
+      let cost = 0;
+      if (ingredient.estimatedCost?.value) {
+        cost = ingredient.estimatedCost.value / 100;
+      } else {
+        // Apply default price if available
+        const defaultPriceCents = getDefaultPrice(resolvedName);
+        if (defaultPriceCents !== null) {
+          cost = defaultPriceCents / 100;
+        }
+      }
+      
       totalEstimatedCost += cost;
 
       if (ingredientMap.has(key)) {

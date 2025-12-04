@@ -6,13 +6,14 @@
  *   node scripts/importCustomRecipes.js --csv ./data/custom.csv \
  *        [--image-source ./images] [--image-dest ./public/images/custom] \
  *        [--image-url /images/custom] [--image-ext .jpg] [--id-offset 400000000]
- *        [--dry-run]
+ *        [--dry-run] [--force]
  */
 
 const fs = require('fs');
 const path = require('path');
 
 const { saveRecipeToDatabase } = require('../src/services/recipeService');
+const { db } = require('../src/config/db');
 
 const DEFAULTS = {
   imageOutputDir: path.join(__dirname, '..', 'public', 'recipe-images', 'custom'),
@@ -22,17 +23,38 @@ const DEFAULTS = {
   defaultServings: Number(process.env.CUSTOM_RECIPE_DEFAULT_SERVINGS) || 4,
 };
 
+const loadEnvOptions = () => ({
+  csvPath: process.env.CUSTOM_RECIPE_CSV || null,
+  imageSourceDir: process.env.CUSTOM_RECIPE_IMAGE_SOURCE || null,
+  imageOutputDir: process.env.CUSTOM_RECIPE_IMAGE_DEST || null,
+  imagePublicPath: process.env.CUSTOM_RECIPE_IMAGE_URL || null,
+  imageExtension: process.env.CUSTOM_RECIPE_IMAGE_EXT || null,
+  idOffset:
+    process.env.CUSTOM_RECIPE_ID_OFFSET !== undefined
+      ? Number(process.env.CUSTOM_RECIPE_ID_OFFSET)
+      : null,
+  defaultServings:
+    process.env.CUSTOM_RECIPE_DEFAULT_SERVINGS !== undefined
+      ? Number(process.env.CUSTOM_RECIPE_DEFAULT_SERVINGS)
+      : null,
+  dryRun: process.env.CUSTOM_RECIPE_DRY_RUN === 'true',
+  force: process.env.CUSTOM_RECIPE_FORCE === 'true',
+});
+
 const parseArgs = () => {
   const args = process.argv.slice(2);
+  const envOptions = loadEnvOptions();
   const options = {
-    csvPath: null,
-    imageSourceDir: null,
-    imageOutputDir: DEFAULTS.imageOutputDir,
-    imagePublicPath: DEFAULTS.imagePublicPath,
-    imageExtension: DEFAULTS.imageExtension,
-    idOffset: DEFAULTS.idOffset,
-    dryRun: false,
-  };
+    csvPath: envOptions.csvPath,
+    imageSourceDir: envOptions.imageSourceDir,
+    imageOutputDir: envOptions.imageOutputDir || DEFAULTS.imageOutputDir,
+    imagePublicPath: envOptions.imagePublicPath || DEFAULTS.imagePublicPath,
+    imageExtension: envOptions.imageExtension || DEFAULTS.imageExtension,
+    idOffset: envOptions.idOffset ?? DEFAULTS.idOffset,
+      defaultServings: envOptions.defaultServings ?? DEFAULTS.defaultServings,
+      dryRun: envOptions.dryRun,
+      force: envOptions.force,
+    };
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -65,6 +87,9 @@ const parseArgs = () => {
       case '--dry-run':
         options.dryRun = true;
         break;
+      case '--force':
+        options.force = true;
+        break;
       default:
         if (!arg.startsWith('--') && !options.csvPath) {
           options.csvPath = arg;
@@ -75,8 +100,16 @@ const parseArgs = () => {
   }
 
   if (!options.csvPath) {
-    throw new Error('Missing required --csv <path-to-file> argument.');
+    const hint = isRenderEnvironment()
+      ? 'Set CUSTOM_RECIPE_CSV in your Render one-off job env.'
+      : 'Pass --csv <path-to-file>.';
+    throw new Error(`Missing required CSV path. ${hint}`);
   }
+
+  options.idOffset = Number.isFinite(options.idOffset) ? options.idOffset : DEFAULTS.idOffset;
+  options.defaultServings = Number.isFinite(options.defaultServings)
+    ? options.defaultServings
+    : DEFAULTS.defaultServings;
 
   options.csvPath = path.resolve(options.csvPath);
   if (options.imageSourceDir) {
@@ -267,6 +300,51 @@ const ensureDir = async (dirPath) => {
   await fs.promises.mkdir(dirPath, { recursive: true });
 };
 
+const isRenderEnvironment = () => {
+  return Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_URL || process.env.RENDER_SERVICE_ID);
+};
+
+const hasExistingCustomRecipes = async (lowerBound, upperBound) => {
+  try {
+    const result = await db.one(
+      'SELECT COUNT(*)::int AS count FROM recipes WHERE spoonacular_id BETWEEN $1 AND $2',
+      [lowerBound, upperBound],
+    );
+    return result.count > 0;
+  } catch (error) {
+    console.warn('Warning: unable to check for existing custom recipes:', error.message || error);
+    return false;
+  }
+};
+
+const printRenderOneOffInstructions = (options) => {
+  if (!isRenderEnvironment()) {
+    return;
+  }
+
+  const parts = ['npm run import:custom -- --csv', options.csvPath || './path/to/custom.csv'];
+  if (options.imageSourceDir) {
+    parts.push('--image-source', options.imageSourceDir);
+  }
+  if (options.imageOutputDir && options.imageOutputDir !== DEFAULTS.imageOutputDir) {
+    parts.push('--image-dest', options.imageOutputDir);
+  }
+  if (options.imagePublicPath && options.imagePublicPath !== DEFAULTS.imagePublicPath) {
+    parts.push('--image-url', options.imagePublicPath);
+  }
+  if (options.imageExtension && options.imageExtension !== DEFAULTS.imageExtension) {
+    parts.push('--image-ext', options.imageExtension);
+  }
+  if (options.idOffset && options.idOffset !== DEFAULTS.idOffset) {
+    parts.push('--id-offset', options.idOffset);
+  }
+
+  const exampleCommand = parts.join(' ');
+  console.log('\nRender detected: this import should be run once as a one-off job after deploy.');
+  console.log('Example Render command:\n ', exampleCommand);
+  console.log('If you have already run this job, the script will skip unless you supply --force.');
+};
+
 const copyImageIfNeeded = async (imageName, options) => {
   if (!imageName) {
     return null;
@@ -382,6 +460,21 @@ const importCustomRecipes = async (options) => {
   if (!rows.length) {
     console.log('No data rows detected in CSV.');
     return;
+  }
+
+  const lowerBoundId = computeStableId(0, options.idOffset);
+  const upperBoundId = computeStableId(rows.length - 1, options.idOffset);
+  printRenderOneOffInstructions(options);
+
+  if (!options.dryRun && !options.force) {
+    const alreadyImported = await hasExistingCustomRecipes(lowerBoundId, upperBoundId);
+    if (alreadyImported) {
+      console.log(
+        `Detected existing recipes in the custom ID range (${lowerBoundId}-${upperBoundId}). `
+        + 'Assuming the import already ran; exiting. Use --force to re-import.',
+      );
+      return;
+    }
   }
 
   console.log(`Processing ${rows.length} recipe rows...`);
